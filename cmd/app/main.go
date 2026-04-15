@@ -4,60 +4,92 @@ import (
 	"context"
 	"log"
 	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"first/internal/cache"
 	"first/internal/config"
 	"first/internal/db"
 	"first/internal/pkg"
+	"first/internal/server"
+	"first/internal/users"
 )
 
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
+	ctx := context.Background()
 
+	// config
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("config load error: %v", err)
 	}
 
+	// logger
 	logger := pkg.NewLogger(cfg.LogLevel)
+	slog.SetDefault(logger)
 
-	logger.Info("config loaded",
+	slog.Info("config loaded",
 		slog.String("env", cfg.AppEnv),
 		slog.String("http_port", cfg.HTTPPort),
 	)
 
+	// postgres
 	pool, err := db.NewPool(ctx, cfg.DatabaseURL())
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("db connection error: %v", err)
 	}
 	defer pool.Close()
+
 	slog.Info("pool connected")
 
-	rdb, err := cache.NewClient(ctx, cfg.RedisAddr(), cfg.Redis.Password, cfg.Redis.DB)
+	// redis
+	redisClient, err := cache.NewClient(
+		ctx,
+		cfg.RedisAddr(),
+		cfg.Redis.Password,
+		cfg.Redis.DB,
+	)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("redis connection error: %v", err)
 	}
-	defer rdb.Close()
+	defer redisClient.Close()
+
 	slog.Info("redis connected")
 
-	err = rdb.Set(ctx, "test", "123", time.Minute).Err()
-	if err != nil {
-		log.Fatal(err)
-	}
+	// users module
+	userRepo := users.NewPostgresRepository(pool)
+	userService := users.NewService(userRepo)
+	userHandler := users.NewHandler(userService)
 
-	val, err := rdb.Get(ctx, "test").Result()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	slog.Info("redis working", slog.String("value", val))
-
-	// сюда потом:
-	// db pool
-	// redis client
 	// router
-	// server.Run()
+	router := server.NewRouter(server.Handlers{
+		UserHandler: userHandler,
+	})
 
+	// http server
+	srv := server.New(router, cfg.HTTPPort)
+
+	go func() {
+		if err := srv.Run(); err != nil {
+			log.Fatalf("server run error: %v", err)
+		}
+	}()
+
+	// graceful shutdown
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	<-stop
+	slog.Info("shutdown signal received")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Fatalf("server shutdown error: %v", err)
+	}
+
+	slog.Info("application stopped")
 }
